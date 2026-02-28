@@ -426,6 +426,7 @@ async def start(message: Message):
         "/track <цепь> <адрес> - Добавить кошелек\n"
         "/list - Показать кошельки\n"
         "/remove <id> - Удалить кошелек\n"
+        "/filter <номер> - Фильтр уведомлений (входящие/исходящие)\n"
         "/chains - Список цепей\n"
         "/help - Показать помощь"
     )
@@ -484,7 +485,9 @@ async def track(message: Message):
         'chain': chain,
         'last_block': current_block,
         'added_at': time.time(),
-        'id': addr_id
+        'id': addr_id,
+        'notify_incoming': True,
+        'notify_outgoing': True,
     }
     save_data()
 
@@ -494,7 +497,8 @@ async def track(message: Message):
         f"Цепь: {config['color']} {config['name']}\n"
         f"Адрес: `{address}`\n"
         f"ID: `{addr_id}`\n\n"
-        f"Отслеживание с блока #{current_block}",
+        f"Отслеживание с блока #{current_block}\n"
+        f"Уведомления: 📥 Входящие ✅ | 📤 Исходящие ✅",
         parse_mode='Markdown'
     )
 
@@ -551,6 +555,57 @@ async def remove(message: Message):
     await message.reply(f"✅ Удален {config['color']} кошелек {format_addr(addr)}")
 
 
+@dp.message(Command("filter"))
+async def filter_wallet(message: Message):
+    args = message.text.split()[1:] if len(message.text.split()) > 1 else []
+
+    if not args:
+        await message.reply(
+            "Использование: /filter <номер>\n"
+            "Пример: /filter 1\n"
+            "Используйте /list для просмотра номеров кошельков"
+        )
+        return
+
+    try:
+        idx = int(args[0]) - 1
+    except (ValueError, IndexError):
+        await message.reply("❌ Неверный номер. Используйте /list для просмотра номеров")
+        return
+
+    chat_id = message.chat.id
+    subs = user_subs.get(chat_id, {})
+
+    if idx < 0 or idx >= len(subs):
+        await message.reply("❌ Неверный номер")
+        return
+
+    addr = list(subs.keys())[idx]
+    data = subs[addr]
+    chain = data['chain']
+    config = RPC_CONFIGS[chain]
+
+    notify_incoming = data.get('notify_incoming', True)
+    notify_outgoing = data.get('notify_outgoing', True)
+
+    in_icon = "✅" if notify_incoming else "❌"
+    out_icon = "✅" if notify_outgoing else "❌"
+
+    keyboard = get_inline_keyboard([
+        (f"📥 Входящие {in_icon}", f"toggle_in_{idx}"),
+        (f"📤 Исходящие {out_icon}", f"toggle_out_{idx}"),
+    ], row_width=2)
+
+    await message.reply(
+        f"⚙️ *Настройки уведомлений*\n"
+        f"Кошелек #{idx + 1}: {config['color']} `{format_addr(addr)}`\n\n"
+        f"📥 Входящие транзакции: {in_icon}\n"
+        f"📤 Исходящие транзакции: {out_icon}",
+        parse_mode='Markdown',
+        reply_markup=keyboard
+    )
+
+
 @dp.callback_query()
 async def button_handler(callback: CallbackQuery):
     await callback.answer()
@@ -590,6 +645,45 @@ async def button_handler(callback: CallbackQuery):
             save_data()
             await callback.message.edit_text(f"✅ Удален {config['color']} кошелек {format_addr(addr)}")
 
+    elif callback.data.startswith("toggle_in_") or callback.data.startswith("toggle_out_"):
+        parts = callback.data.split("_")
+        direction = parts[1]  # 'in' or 'out'
+        idx = int(parts[2])
+        chat_id = callback.message.chat.id
+        subs = user_subs.get(chat_id, {})
+
+        if idx < len(subs):
+            addr = list(subs.keys())[idx]
+            data = subs[addr]
+            chain = data['chain']
+            config = RPC_CONFIGS[chain]
+
+            if direction == 'in':
+                data['notify_incoming'] = not data.get('notify_incoming', True)
+            else:
+                data['notify_outgoing'] = not data.get('notify_outgoing', True)
+
+            save_data()
+
+            notify_incoming = data.get('notify_incoming', True)
+            notify_outgoing = data.get('notify_outgoing', True)
+            in_icon = "✅" if notify_incoming else "❌"
+            out_icon = "✅" if notify_outgoing else "❌"
+
+            keyboard = get_inline_keyboard([
+                (f"📥 Входящие {in_icon}", f"toggle_in_{idx}"),
+                (f"📤 Исходящие {out_icon}", f"toggle_out_{idx}"),
+            ], row_width=2)
+
+            await callback.message.edit_text(
+                f"⚙️ *Настройки уведомлений*\n"
+                f"Кошелек #{idx + 1}: {config['color']} `{format_addr(addr)}`\n\n"
+                f"📥 Входящие транзакции: {in_icon}\n"
+                f"📤 Исходящие транзакции: {out_icon}",
+                parse_mode='Markdown',
+                reply_markup=keyboard
+            )
+
 
 # ==================== ФОНОВАЯ ЗАДАЧА ====================
 async def check_transactions():
@@ -618,7 +712,15 @@ async def check_transactions():
                         data['last_block'] = current_block
                         save_data()
 
-                        for tx in txs[-5:]:
+                        notify_incoming = data.get('notify_incoming', True)
+                        notify_outgoing = data.get('notify_outgoing', True)
+                        filtered_txs = [
+                            tx for tx in txs
+                            if (tx['type'] == 'in' and notify_incoming) or
+                               (tx['type'] == 'out' and notify_outgoing)
+                        ]
+
+                        for tx in filtered_txs[-5:]:
                             msg = format_tx_message(chain, tx, address)
                             try:
                                 await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
