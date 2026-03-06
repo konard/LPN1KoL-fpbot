@@ -1,17 +1,13 @@
 import os
 import logging
 import asyncio
-import json
 import time
 import pickle
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import List, Optional, Any, Tuple
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from cachetools import TTLCache
@@ -19,11 +15,8 @@ import aiohttp
 
 # ==================== КОНФИГУРАЦИЯ ====================
 load_dotenv()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN_MAIN")
 DATA_FILE = "user_data.pkl"
-
-if not BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN не найден в .env файле!")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -146,15 +139,6 @@ RPC_CONFIGS = {
             'https://moonbeam.drpc.org'
         ]
     },
-    'tron': {
-        'name': 'TRON', 'symbol': 'TRX', 'color': '🔴', 'type': 'tron',
-        'primary': ['https://api.trongrid.io'],
-        'fallback': [
-            'https://api.tronstack.io',
-            'https://rpc.ankr.com/tron_jsonrpc',
-            'https://tron.drpc.org'
-        ]
-    },
     'hyperliquid': {
         'name': 'Hyperliquid', 'symbol': 'HYPE', 'color': '💧', 'type': 'hyperliquid',
         'primary': ['https://rpc.hyperliquid.xyz/evm'],
@@ -200,26 +184,26 @@ user_subs = {}
 
 
 def load_data():
-    """Загрузить данные из файла"""
+    """Загрузить EVM данные"""
     global user_subs
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'rb') as f:
                 user_subs = pickle.load(f)
-            logger.info(f"✅ Загружено {sum(len(w) for w in user_subs.values())} кошельков")
+            logger.info(f"Загружено {sum(len(w) for w in user_subs.values())} EVM кошельков")
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки данных: {e}")
+        logger.error(f"Ошибка загрузки EVM данных: {e}")
         user_subs = {}
 
 
 def save_data():
-    """Сохранить данные в файл"""
+    """Сохранить EVM данные"""
     try:
         with open(DATA_FILE, 'wb') as f:
             pickle.dump(user_subs, f)
-        logger.info("💾 Данные сохранены")
     except Exception as e:
-        logger.error(f"❌ Ошибка сохранения данных: {e}")
+        logger.error(f"Ошибка сохранения EVM данных: {e}")
+
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -227,20 +211,27 @@ def validate_evm(addr: str) -> bool:
     return addr.startswith('0x') and len(addr) == 42 and all(c in '0123456789abcdefABCDEF' for c in addr[2:])
 
 
-def validate_tron(addr: str) -> bool:
-    return addr.startswith('T') and len(addr) == 34
-
-
-def validate_addr(addr: str, chain: str = None) -> Tuple[bool, str]:
+def validate_addr(addr: str) -> Tuple[bool, str]:
     if not addr:
         return False, "Адрес не может быть пустым"
-    if chain == 'tron':
-        return (True, "") if validate_tron(addr) else (False, "Неверный TRON адрес (должен начинаться с T, 34 символа)")
     return (True, "") if validate_evm(addr) else (False, "Неверный EVM адрес (должен начинаться с 0x, 42 символа)")
 
 
 def format_addr(addr: str) -> str:
-    return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
+    if len(addr) <= 10:
+        return addr
+    return f"{addr[:6]}...{addr[-4:]}"
+
+
+def get_all_wallets(chat_id: int) -> List[Tuple[str, dict]]:
+    """Список кошельков: (address, data)"""
+    return list(user_subs.get(chat_id, {}).items())
+
+
+def wallet_display(addr: str, data: dict) -> Tuple[str, str]:
+    """Возвращает (color+name, formatted_addr) для отображения"""
+    config = RPC_CONFIGS[data['chain']]
+    return (f"{config['color']} {config['name']}", format_addr(addr))
 
 
 def get_inline_keyboard(buttons: List[Tuple[str, str]], row_width: int = 1) -> InlineKeyboardMarkup:
@@ -267,7 +258,7 @@ class AsyncRPC:
     async def __aexit__(self, *args):
         await self.session.close()
 
-    async def request(self, method: str, params: list = None, is_tron: bool = False) -> Optional[Any]:
+    async def request(self, method: str, params: list = None) -> Optional[Any]:
         if params is None:
             params = []
 
@@ -276,23 +267,17 @@ class AsyncRPC:
 
         for rpc_url in rpcs_to_try:
             try:
-                if is_tron:
-                    async with self.session.post(f"{rpc_url}{method}", json=params[0] if params else {},
-                                                 timeout=self.config['timeout']) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-                else:
-                    payload = {
-                        "jsonrpc": "2.0",
-                        "method": method,
-                        "params": params,
-                        "id": int(time.time() * 1000) % 10000
-                    }
-                    async with self.session.post(rpc_url, json=payload, timeout=self.config['timeout']) as resp:
-                        result = await resp.json()
-                        if "error" not in result:
-                            self.last_success = rpc_url
-                            return result.get("result")
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": params,
+                    "id": int(time.time() * 1000) % 10000
+                }
+                async with self.session.post(rpc_url, json=payload, timeout=self.config['timeout']) as resp:
+                    result = await resp.json()
+                    if "error" not in result:
+                        self.last_success = rpc_url
+                        return result.get("result")
 
                 rpc_cache.mark_error(rpc_url)
             except Exception as e:
@@ -303,23 +288,14 @@ class AsyncRPC:
         return None
 
     async def get_block_number(self) -> int:
-        if self.config['type'] == 'tron':
-            result = await self.request('/wallet/getnowblock', [{}], is_tron=True)
-            return result['block_header']['raw_data']['number'] if result else 0
         result = await self.request("eth_blockNumber")
         return int(result, 16) if result else 0
 
     async def get_balance(self, address: str) -> float:
-        if self.config['type'] == 'tron':
-            result = await self.request('/wallet/getaccount', [{'address': address, 'visible': True}], is_tron=True)
-            return result.get('balance', 0) / 1_000_000 if result else 0
         result = await self.request("eth_getBalance", [address, "latest"])
         return int(result, 16) / (10 ** self.config['decimals']) if result else 0
 
     async def get_block(self, block_num: int, full: bool = True) -> Optional[dict]:
-        if self.config['type'] == 'tron':
-            result = await self.request('/wallet/getblockbynum', [{'num': block_num, 'visible': True}], is_tron=True)
-            return result
         result = await self.request("eth_getBlockByNumber", [hex(block_num), full])
         return result
 
@@ -330,7 +306,7 @@ async def get_transactions(chain: str, address: str, from_block: int, to_block: 
     Получить транзакции для указанного адреса в диапазоне блоков.
 
     Args:
-        chain: Идентификатор сети (ethereum, bsc, tron и т.д.)
+        chain: Идентификатор сети (ethereum, bsc и т.д.)
         address: Адрес кошелька для отслеживания
         from_block: Начальный блок (не включительно)
         to_block: Конечный блок (включительно)
@@ -341,7 +317,6 @@ async def get_transactions(chain: str, address: str, from_block: int, to_block: 
     txs = []
     addr_lower = address.lower()
     config = RPC_CONFIGS.get(chain, {})
-    chain_type = config.get('type', 'evm')
 
     logger.debug(f"Поиск транзакций для {address[:10]}... на {chain} (блоки {from_block+1}-{to_block})")
 
@@ -361,44 +336,7 @@ async def get_transactions(chain: str, address: str, from_block: int, to_block: 
             if not cached:
                 rpc_cache.blocks[f"{chain}_{block_num}"] = block
 
-            # Обработка TRON транзакций
-            if chain_type == 'tron':
-                for tx in block.get('transactions', []):
-                    if 'raw_data' not in tx:
-                        continue
-                    for contract in tx['raw_data'].get('contract', []):
-                        if contract.get('type') == 'TransferContract':
-                            param_value = contract.get('parameter', {}).get('value', {})
-                            tx_from = param_value.get('owner_address', '')
-                            tx_to = param_value.get('to_address', '')
-
-                            # Нормализуем адреса для сравнения
-                            tx_from_lower = tx_from.lower() if tx_from else ''
-                            tx_to_lower = tx_to.lower() if tx_to else ''
-
-                            is_outgoing = tx_from_lower == addr_lower
-                            is_incoming = tx_to_lower == addr_lower
-
-                            if is_outgoing or is_incoming:
-                                tx_type = 'out' if is_outgoing else 'in'
-                                amount = param_value.get('amount', 0) / 1_000_000
-
-                                logger.debug(
-                                    f"Найдена {tx_type} транзакция TRON: "
-                                    f"{amount:.6f} TRX, блок {block_num}"
-                                )
-
-                                txs.append({
-                                    'hash': tx.get('txID', ''),
-                                    'from': tx_from_lower,
-                                    'to': tx_to_lower,
-                                    'value': amount,
-                                    'block': block_num,
-                                    'type': tx_type
-                                })
-            # Обработка EVM транзакций
-            else:
-                for tx in block.get('transactions', []):
+            for tx in block.get('transactions', []):
                     if not isinstance(tx, dict):
                         logger.debug(f"Блок {block_num}: транзакция не является dict")
                         continue
@@ -488,14 +426,14 @@ async def start(message: Message):
 
     text = (
         f"🚀 *Multi-Chain Wallet Tracker*\n\n"
-        "Отслеживайте кошельки на 13 блокчейнах:\n"
+        "Отслеживайте кошельки на 12 блокчейнах:\n"
         "• Ethereum, BSC, Polygon, Arbitrum, Optimism\n"
         "• Avalanche, Base, Fantom, Gnosis, Celo, Moonbeam\n"
-        "• TRON и Hyperliquid\n\n"
+        "• Hyperliquid\n\n"
         "*Команды:*\n"
         "/track <цепь> <адрес> - Добавить кошелек\n"
         "/list - Показать кошельки\n"
-        "/remove <id> - Удалить кошелек\n"
+        "/remove <номер> - Удалить кошелек\n"
         "/filter <номер> - Фильтр уведомлений (входящие/исходящие)\n"
         "/chains - Список цепей\n"
         "/help - Показать помощь"
@@ -529,12 +467,13 @@ async def track(message: Message):
         await message.reply(f"❌ Неподдерживаемая цепь. Используйте /chains для списка.")
         return
 
-    valid, err = validate_addr(address, chain)
+    valid, err = validate_addr(address)
     if not valid:
         await message.reply(f"❌ {err}")
         return
 
     chat_id = message.chat.id
+
     if chat_id not in user_subs:
         user_subs[chat_id] = {}
 
@@ -549,13 +488,10 @@ async def track(message: Message):
         logger.error(f"Ошибка получения блока: {e}")
         current_block = 0
 
-    addr_id = f"{chain[:3]}_{len(user_subs[chat_id])}"
-
     user_subs[chat_id][address] = {
         'chain': chain,
         'last_block': current_block,
         'added_at': time.time(),
-        'id': addr_id,
         'notify_incoming': True,
         'notify_outgoing': True,
     }
@@ -565,8 +501,7 @@ async def track(message: Message):
     await message.reply(
         f"✅ *Кошелек добавлен*\n"
         f"Цепь: {config['color']} {config['name']}\n"
-        f"Адрес: `{address}`\n"
-        f"ID: `{addr_id}`\n\n"
+        f"Адрес: `{address}`\n\n"
         f"Отслеживание с блока #{current_block}\n"
         f"Уведомления: 📥 Входящие ✅ | 📤 Исходящие ✅",
         parse_mode='Markdown'
@@ -576,19 +511,18 @@ async def track(message: Message):
 @dp.message(Command("list"))
 async def list_wallets(message: Message):
     chat_id = message.chat.id
-    subs = user_subs.get(chat_id, {})
+    wallets = get_all_wallets(chat_id)
 
-    if not subs:
+    if not wallets:
         await message.reply("📭 Нет отслеживаемых кошельков. Используйте /track для добавления.")
         return
 
     msg = "*📋 Отслеживаемые кошельки:*\n\n"
     keyboard_buttons = []
 
-    for i, (addr, data) in enumerate(subs.items()):
-        config = RPC_CONFIGS[data['chain']]
-        addr_short = format_addr(addr)
-        msg += f"{i + 1}. {config['color']} `{addr_short}` ({config['name']})\n"
+    for i, (addr, data) in enumerate(wallets):
+        display_name, addr_short = wallet_display(addr, data)
+        msg += f"{i + 1}. {display_name} `{addr_short}`\n"
         keyboard_buttons.append((f"❌ Удалить #{i + 1}", f"remove_{i}"))
 
     keyboard = get_inline_keyboard(keyboard_buttons)
@@ -600,29 +534,29 @@ async def remove(message: Message):
     args = message.text.split()[1:] if len(message.text.split()) > 1 else []
 
     if not args:
-        await message.reply("Использование: /remove <id>\nИспользуйте /list для просмотра ID")
+        await message.reply("Использование: /remove <номер>\nИспользуйте /list для просмотра номеров")
         return
 
     try:
         idx = int(args[0]) - 1
     except:
-        await message.reply("❌ Неверный ID. Используйте /list для просмотра ID")
+        await message.reply("❌ Неверный номер")
         return
 
     chat_id = message.chat.id
-    subs = user_subs.get(chat_id, {})
+    wallets = get_all_wallets(chat_id)
 
-    if idx < 0 or idx >= len(subs):
-        await message.reply("❌ Неверный ID")
+    if idx < 0 or idx >= len(wallets):
+        await message.reply("❌ Неверный номер")
         return
 
-    addr = list(subs.keys())[idx]
-    chain = subs[addr]['chain']
-    config = RPC_CONFIGS[chain]
+    addr, data = wallets[idx]
+    display_name, addr_short = wallet_display(addr, data)
 
-    del subs[addr]
+    del user_subs[chat_id][addr]
     save_data()
-    await message.reply(f"✅ Удален {config['color']} кошелек {format_addr(addr)}")
+
+    await message.reply(f"✅ Удален {display_name} кошелек {addr_short}")
 
 
 @dp.message(Command("filter"))
@@ -644,16 +578,14 @@ async def filter_wallet(message: Message):
         return
 
     chat_id = message.chat.id
-    subs = user_subs.get(chat_id, {})
+    wallets = get_all_wallets(chat_id)
 
-    if idx < 0 or idx >= len(subs):
+    if idx < 0 or idx >= len(wallets):
         await message.reply("❌ Неверный номер")
         return
 
-    addr = list(subs.keys())[idx]
-    data = subs[addr]
-    chain = data['chain']
-    config = RPC_CONFIGS[chain]
+    addr, data = wallets[idx]
+    display_name, addr_short = wallet_display(addr, data)
 
     notify_incoming = data.get('notify_incoming', True)
     notify_outgoing = data.get('notify_outgoing', True)
@@ -668,7 +600,7 @@ async def filter_wallet(message: Message):
 
     await message.reply(
         f"⚙️ *Настройки уведомлений*\n"
-        f"Кошелек #{idx + 1}: {config['color']} `{format_addr(addr)}`\n\n"
+        f"Кошелек #{idx + 1}: {display_name} `{addr_short}`\n\n"
         f"📥 Входящие транзакции: {in_icon}\n"
         f"📤 Исходящие транзакции: {out_icon}",
         parse_mode='Markdown',
@@ -681,22 +613,19 @@ async def button_handler(callback: CallbackQuery):
     await callback.answer()
 
     if callback.data == "list":
-        # Создаем контекст для list_wallets
-        msg = callback.message
-        chat_id = msg.chat.id
-        subs = user_subs.get(chat_id, {})
+        chat_id = callback.message.chat.id
+        wallets = get_all_wallets(chat_id)
 
-        if not subs:
+        if not wallets:
             await callback.message.edit_text("📭 Нет отслеживаемых кошельков. Используйте /track для добавления.")
             return
 
         text = "*📋 Отслеживаемые кошельки:*\n\n"
         keyboard_buttons = []
 
-        for i, (addr, data) in enumerate(subs.items()):
-            config = RPC_CONFIGS[data['chain']]
-            addr_short = format_addr(addr)
-            text += f"{i + 1}. {config['color']} `{addr_short}` ({config['name']})\n"
+        for i, (addr, data) in enumerate(wallets):
+            display_name, addr_short = wallet_display(addr, data)
+            text += f"{i + 1}. {display_name} `{addr_short}`\n"
             keyboard_buttons.append((f"❌ Удалить #{i + 1}", f"remove_{i}"))
 
         keyboard = get_inline_keyboard(keyboard_buttons)
@@ -705,28 +634,27 @@ async def button_handler(callback: CallbackQuery):
     elif callback.data.startswith("remove_"):
         idx = int(callback.data.split("_")[1])
         chat_id = callback.message.chat.id
-        subs = user_subs.get(chat_id, {})
+        wallets = get_all_wallets(chat_id)
 
-        if idx < len(subs):
-            addr = list(subs.keys())[idx]
-            chain = subs[addr]['chain']
-            config = RPC_CONFIGS[chain]
-            del subs[addr]
+        if idx < len(wallets):
+            addr, data = wallets[idx]
+            display_name, addr_short = wallet_display(addr, data)
+
+            del user_subs[chat_id][addr]
             save_data()
-            await callback.message.edit_text(f"✅ Удален {config['color']} кошелек {format_addr(addr)}")
+
+            await callback.message.edit_text(f"✅ Удален {display_name} кошелек {addr_short}")
 
     elif callback.data.startswith("toggle_in_") or callback.data.startswith("toggle_out_"):
         parts = callback.data.split("_")
         direction = parts[1]  # 'in' or 'out'
         idx = int(parts[2])
         chat_id = callback.message.chat.id
-        subs = user_subs.get(chat_id, {})
+        wallets = get_all_wallets(chat_id)
 
-        if idx < len(subs):
-            addr = list(subs.keys())[idx]
-            data = subs[addr]
-            chain = data['chain']
-            config = RPC_CONFIGS[chain]
+        if idx < len(wallets):
+            addr, data = wallets[idx]
+            display_name, addr_short = wallet_display(addr, data)
 
             if direction == 'in':
                 data['notify_incoming'] = not data.get('notify_incoming', True)
@@ -747,7 +675,7 @@ async def button_handler(callback: CallbackQuery):
 
             await callback.message.edit_text(
                 f"⚙️ *Настройки уведомлений*\n"
-                f"Кошелек #{idx + 1}: {config['color']} `{format_addr(addr)}`\n\n"
+                f"Кошелек #{idx + 1}: {display_name} `{addr_short}`\n\n"
                 f"📥 Входящие транзакции: {in_icon}\n"
                 f"📤 Исходящие транзакции: {out_icon}",
                 parse_mode='Markdown',
@@ -846,10 +774,9 @@ async def check_transactions():
 async def main():
     load_data()
 
-    # Запускаем фоновую задачу
     asyncio.create_task(check_transactions())
 
-    logger.info(f"🤖 Бот запущен! Отслеживается {len(RPC_CONFIGS)} цепей")
+    logger.info(f"🤖 Бот запущен! {len(RPC_CONFIGS)} цепей")
     for chain, config in RPC_CONFIGS.items():
         logger.info(f"  • {chain}: {len(config['all_rpcs'])} RPC endpoints")
 
